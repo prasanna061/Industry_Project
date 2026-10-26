@@ -1,5 +1,4 @@
-
-from datetime import date, timedelta
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 import json
@@ -20,10 +19,12 @@ MODEL_DIR = BASE_DIR / "models"
 
 MODEL_PATH = MODEL_DIR / "mandi_xgboost.json"
 CONFIG_PATH = MODEL_DIR / "model_config.json"
+FORECAST_PATH = MODEL_DIR / "forecast_7_days.csv"
 DATA_PATH = BASE_DIR / "data" / "sambhal_onion_prices.csv"
 
 LAGS = [1, 2, 3, 7, 14, 21, 30]
 WINDOWS = [7, 14, 30]
+
 SUPPORTED_COMMODITY = "Onion"
 SUPPORTED_MARKET = "Sambhal"
 SUPPORTED_STATE = "Uttar Pradesh"
@@ -40,7 +41,7 @@ app = FastAPI(
         "FastAPI backend for the Mandi Price Intelligence "
         "dashboard and its XGBoost price forecasting model."
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -93,8 +94,7 @@ def get_price_series():
     if not DATA_PATH.exists():
         raise FileNotFoundError(
             "Historical training data is missing. Place the "
-            "1740-record sambhal_onion_prices.csv file in "
-            "backend/data/."
+            "sambhal_onion_prices.csv file in backend/data/."
         )
 
     df = pd.read_csv(DATA_PATH)
@@ -178,7 +178,9 @@ def make_features(prices):
 
 
 # --------------------------------------------------
-# Generate recursive forecasts with the trained model
+# Generate forecasts with XGBoost
+# Kept available for future retraining workflows.
+# The /api/forecasts endpoint below reads the saved CSV.
 # --------------------------------------------------
 
 def generate_forecast(horizon: int):
@@ -192,8 +194,6 @@ def generate_forecast(horizon: int):
     if latest_date is None:
         raise ValueError("No valid latest observation was found.")
 
-    # Fill missing historical calendar dates for feature creation,
-    # consistent with the existing training script.
     history = observed_prices.loc[:latest_date].ffill().copy()
     predictions = []
 
@@ -231,7 +231,6 @@ def generate_forecast(horizon: int):
             "unit": PRICE_UNIT,
         })
 
-        # Feed the prediction into the next forecast step.
         history.loc[next_date] = predicted_price
 
     days_since_data = (date.today() - latest_date.date()).days
@@ -241,14 +240,133 @@ def generate_forecast(horizon: int):
         "market": SUPPORTED_MARKET,
         "state": SUPPORTED_STATE,
         "unit": PRICE_UNIT,
-        "horizon_days": horizon,
+        "horizon_days": len(predictions),
         "latest_observation_date": latest_date.date().isoformat(),
         "days_since_latest_observation": days_since_data,
         "data_is_stale": days_since_data > 14,
         "forecast": predictions,
         "disclaimer": (
-            "Model estimates based on the available historical data. "
+            "Model estimates based on available historical data. "
             "They are not guaranteed market prices."
+        ),
+    }
+
+
+# --------------------------------------------------
+# Read the existing saved seven-day forecast CSV
+# --------------------------------------------------
+
+def read_saved_forecast(horizon: int):
+    if not FORECAST_PATH.exists():
+        raise FileNotFoundError(
+            f"Saved forecast file not found: {FORECAST_PATH}"
+        )
+
+    df = pd.read_csv(FORECAST_PATH)
+
+    required_columns = {
+        "report_date",
+        "predicted_modal_price",
+    }
+
+    if not required_columns.issubset(df.columns):
+        raise ValueError(
+            "The saved forecast CSV must contain "
+            "'report_date' and 'predicted_modal_price' columns."
+        )
+
+    df["report_date"] = pd.to_datetime(
+        df["report_date"], errors="coerce"
+    )
+
+    df["predicted_modal_price"] = pd.to_numeric(
+        df["predicted_modal_price"], errors="coerce"
+    )
+
+    df = df.dropna(
+        subset=["report_date", "predicted_modal_price"]
+    )
+
+    df = df[df["predicted_modal_price"] >= 0]
+    df = df.sort_values("report_date")
+    df = df.drop_duplicates("report_date", keep="last")
+    df = df.head(horizon)
+
+    if df.empty:
+        raise ValueError(
+            "The saved forecast CSV contains no valid forecast rows."
+        )
+
+    forecast_rows = []
+
+    for _, row in df.iterrows():
+        forecast_rows.append({
+            "report_date": row["report_date"].date().isoformat(),
+            "predicted_modal_price": round(
+                float(row["predicted_modal_price"]), 2
+            ),
+            "unit": PRICE_UNIT,
+        })
+
+    # Use the training-data date from model_config.json to determine
+    # how old the data behind this forecast is.
+    latest_date = None
+
+    try:
+        config = get_config()
+        configured_date = config.get("training_data_latest_date")
+
+        if configured_date:
+            parsed_date = pd.to_datetime(
+                configured_date, errors="coerce"
+            )
+
+            if not pd.isna(parsed_date):
+                latest_date = parsed_date.date()
+
+    except (FileNotFoundError, ValueError, TypeError):
+        latest_date = None
+
+    # Fallback to the historical dataset if configuration has no date.
+    if latest_date is None:
+        try:
+            prices = get_price_series()
+            last_timestamp = prices.last_valid_index()
+
+            if last_timestamp is not None:
+                latest_date = last_timestamp.date()
+
+        except (FileNotFoundError, ValueError):
+            latest_date = None
+
+    days_since_data = (
+        (date.today() - latest_date).days
+        if latest_date is not None
+        else None
+    )
+
+    return {
+        "commodity": SUPPORTED_COMMODITY,
+        "market": SUPPORTED_MARKET,
+        "state": SUPPORTED_STATE,
+        "unit": PRICE_UNIT,
+        "horizon_days": len(forecast_rows),
+        "latest_observation_date": (
+            latest_date.isoformat()
+            if latest_date is not None
+            else None
+        ),
+        "days_since_latest_observation": days_since_data,
+        "data_is_stale": (
+            days_since_data is None or days_since_data > 14
+        ),
+        "forecast": forecast_rows,
+        "forecast_source": FORECAST_PATH.name,
+        "disclaimer": (
+            "These are saved model estimates, not guaranteed or "
+            "current market prices. Check the forecast dates. "
+            "The saved forecast may be outdated if the underlying "
+            "historical data has not been refreshed."
         ),
     }
 
@@ -273,6 +391,7 @@ def health():
         "model_file_exists": MODEL_PATH.exists(),
         "config_file_exists": CONFIG_PATH.exists(),
         "historical_data_file_exists": DATA_PATH.exists(),
+        "saved_forecast_file_exists": FORECAST_PATH.exists(),
     }
 
 
@@ -284,15 +403,15 @@ def model_info():
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
-    latest_date = config.get("training_data_latest_date")
-
     return {
         "model": "XGBoost",
         "commodity": config["commodity"],
         "market": config["market"],
         "state": config["state"],
         "unit": config["unit"],
-        "training_data_latest_date": latest_date,
+        "training_data_latest_date": config.get(
+            "training_data_latest_date"
+        ),
         "forecast_horizon_days": config["horizon_days"],
         "metrics": {
             "mae": config.get("final_test_mae"),
@@ -324,13 +443,17 @@ def markets(
     if state.casefold() != SUPPORTED_STATE.casefold():
         raise HTTPException(
             status_code=404,
-            detail="The trained model currently supports Uttar Pradesh only.",
+            detail=(
+                "The trained model currently supports "
+                "Uttar Pradesh only."
+            ),
         )
 
     try:
         prices = get_price_series()
         latest_date = prices.last_valid_index()
         latest_price = float(prices.loc[latest_date])
+
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
@@ -375,6 +498,7 @@ def historical_prices(
 
     try:
         prices = get_price_series().dropna().tail(limit)
+
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
@@ -414,8 +538,11 @@ def forecasts(
         )
 
     try:
-        return generate_forecast(horizon)
-    except (FileNotFoundError, ValueError) as exc:
+        # Return the saved CSV forecast rather than generating
+        # a new forecast on every API request.
+        return read_saved_forecast(horizon)
+
+    except (FileNotFoundError, ValueError, KeyError) as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
 
@@ -424,6 +551,7 @@ def integrity_status():
     try:
         prices = get_price_series()
         latest_date = prices.last_valid_index()
+
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
