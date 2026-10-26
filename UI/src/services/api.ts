@@ -42,7 +42,9 @@ async function request<T>(path: string): Promise<T> {
 }
 
 function asObject(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value)
+  return value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
 }
@@ -81,11 +83,16 @@ function firstValue(
 
 function toPrice(value: unknown): number | null {
   const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? number : null;
+
+  return Number.isFinite(number) && number > 0
+    ? number
+    : null;
 }
 
 function toDate(value: unknown): string {
-  if (value === undefined || value === null) return "";
+  if (value === undefined || value === null) {
+    return "";
+  }
 
   const text = String(value);
   const date = new Date(text);
@@ -104,18 +111,35 @@ export async function getPrices(limit = 365): Promise<PricePoint[]> {
     `/api/prices?commodity=Onion&market=Sambhal&limit=${limit}`
   );
 
-  return findArray(response, ["prices", "history", "data", "items", "records"])
-    .map((row) => {
-      const date = toDate(
-        firstValue(row, ["date", "report_date", "arrival_date", "day"])
-      );
-      const price = toPrice(
-        firstValue(row, ["modal_price", "price", "modalPrice", "value"])
-      );
-
-      return { date, price };
-    })
-    .filter((row) => row.date && row.price !== null) as PricePoint[];
+  return findArray(response, [
+    "prices",
+    "history",
+    "data",
+    "items",
+    "records",
+  ])
+    .map((row) => ({
+      date: toDate(
+        firstValue(row, [
+          "date",
+          "report_date",
+          "arrival_date",
+          "day",
+        ])
+      ),
+      price: toPrice(
+        firstValue(row, [
+          "modal_price",
+          "price",
+          "modalPrice",
+          "value",
+        ])
+      ),
+    }))
+    .filter(
+      (row): row is { date: string; price: number } =>
+        Boolean(row.date) && row.price !== null
+    );
 }
 
 export async function getForecast(
@@ -126,22 +150,33 @@ export async function getForecast(
   );
 
   const object = asObject(response);
+
+  // The backend returns "forecast", with rows containing
+  // "report_date" and "predicted_modal_price".
   const rows = findArray(response, [
-    "forecasts",
     "forecast",
+    "forecasts",
     "predictions",
     "data",
     "items",
     "results",
   ]);
 
-  const points = rows
+  const points: ForecastPoint[] = rows
     .map((row) => {
       const date = toDate(
-        firstValue(row, ["date", "forecast_date", "target_date", "day"])
+        firstValue(row, [
+          "report_date",
+          "date",
+          "forecast_date",
+          "target_date",
+          "day",
+        ])
       );
+
       const price = toPrice(
         firstValue(row, [
+          "predicted_modal_price",
           "predicted_price",
           "forecast_price",
           "modal_price",
@@ -153,15 +188,25 @@ export async function getForecast(
 
       return { date, price };
     })
-    .filter((row) => row.date && row.price !== null) as ForecastPoint[];
+    .filter(
+      (row): row is { date: string; price: number } =>
+        Boolean(row.date) && row.price !== null
+    );
 
-  const staleValue = firstValue(object, ["stale", "is_stale", "forecast_stale"]);
+  const staleValue = firstValue(object, [
+    "data_is_stale",
+    "stale",
+    "is_stale",
+    "forecast_stale",
+  ]);
+
   const stale =
     staleValue === true ||
     staleValue === "true" ||
     staleValue === 1;
 
   const latestHistoricalDate = firstValue(object, [
+    "latest_observation_date",
     "latest_historical_date",
     "latest_date",
     "data_through",
@@ -169,6 +214,7 @@ export async function getForecast(
   ]);
 
   const message = firstValue(object, [
+    "disclaimer",
     "message",
     "warning",
     "status_message",
